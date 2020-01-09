@@ -9,7 +9,7 @@ const {
 } = require('./util');
 const supported = require('./supported');
 
-const minimumBytes = 4100;
+const minimumBytes = 41000;
 
 async function fromStream(stream) {
 	const tokenizer = await strtok3.fromStream(stream);
@@ -35,6 +35,13 @@ function fromBuffer(input) {
 	return fromTokenizer(tokenizer);
 }
 
+function _find(buffer, headers) {
+	const strBuf = new Buffer(buffer).toString('hex');
+	const strHea = new Buffer(headers).toString('hex');
+	let regex = new RegExp(`${strHea}`, "g");
+	return regex.exec(strBuf) || false;
+}
+
 function _check(buffer, headers, options) {
 	options = {
 		offset: 0,
@@ -58,10 +65,10 @@ function _check(buffer, headers, options) {
 
 async function fromTokenizer(tokenizer) {
 	let buffer = Buffer.alloc(minimumBytes);
-	const bytesRead = 12;
+	const bytesRead = 41000;
 	const check = (header, options) => _check(buffer, header, options);
 	const checkString = (header, options) => check(stringToBytes(header), options);
-
+	const find = (tofind) => _find(buffer, tofind);
 	await tokenizer.peekBuffer(buffer, 0, bytesRead);
 
 	// -- 2-byte signatures --
@@ -1068,10 +1075,17 @@ async function fromTokenizer(tokenizer) {
 	}
 
 	if (check([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3E])) {
-		return {
-			ext: 'msi',
-			mime: 'application/x-msi'
-		};
+		if (find([0x04, 0x00, 0x04, 0x00, 0x40, 0x00, 0x00, 0x00])){
+			return {
+				ext: 'xlsx',
+				mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+			};
+		} else {
+			return {
+				ext: 'msi',
+				mime: 'application/x-msi'
+			};
+		}		
 	}
 
 	if (check([0x06, 0x0E, 0x2B, 0x34, 0x02, 0x05, 0x01, 0x01, 0x0D, 0x01, 0x02, 0x01, 0x01, 0x02])) {
