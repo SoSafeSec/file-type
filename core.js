@@ -9,7 +9,7 @@ const {
 } = require('./util');
 const supported = require('./supported');
 
-const minimumBytes = 41000;
+const minimumBytes = 4100;
 
 async function fromStream(stream) {
 	const tokenizer = await strtok3.fromStream(stream);
@@ -65,7 +65,11 @@ function _check(buffer, headers, options) {
 
 async function fromTokenizer(tokenizer) {
 	let buffer = Buffer.alloc(minimumBytes);
-	const bytesRead = 41000;
+	const bytesRead =  tokenizer.fileInfo.size > 12 ? 12 :  tokenizer.fileInfo.size;
+	if(bytesRead === 0) return {
+		ext: '',
+		mime: 'example/example'
+	};
 	const check = (header, options) => _check(buffer, header, options);
 	const checkString = (header, options) => check(stringToBytes(header), options);
 	const find = (tofind) => _find(buffer, tofind);
@@ -1075,6 +1079,7 @@ async function fromTokenizer(tokenizer) {
 	}
 
 	if (check([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3E])) {
+		await tokenizer.readBuffer(buffer, 0, 4100 < tokenizer.fileInfo.size ? 4100 : tokenizer.fileInfo.size );
 		if (find([0x04, 0x00, 0x04, 0x00, 0x40, 0x00, 0x00, 0x00])){
 			return {
 				ext: 'xlsx',
