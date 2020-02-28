@@ -12,8 +12,6 @@ $ npm install file-type
 
 ## Usage
 
-❗️ Please be aware, the API recently changed to support smarter and more specialized methods to determine the file type.
-
 #### Node.js
 
 Determine file type from a file:
@@ -34,7 +32,7 @@ const FileType = require('file-type');
 const readChunk = require('read-chunk');
 
 (async () => {
-	const buffer = readChunk.sync('Unicorn.png', 0, fileType.minimumBytes);
+	const buffer = readChunk.sync('Unicorn.png', 0, 4100);
 
 	console.log(await FileType.fromBuffer(buffer));
 	//=> {ext: 'png', mime: 'image/png'}
@@ -217,6 +215,31 @@ const audioTrackUrl = 'https://test-audio.netlify.com/Various%20Artists%20-%2020
 })();
 ```
 
+Or use [`@tokenizer/s3`](https://github.com/Borewit/tokenizer-s3) to determine the file type of a file stored on [Amazon S3](https://aws.amazon.com/s3):
+
+```js
+const FileType = require('file-type');
+const S3 = require('aws-sdk/clients/s3');
+const {makeTokenizer} = require('@tokenizer/s3');
+
+(async () => {
+	// Initialize the S3 client
+	const s3 = new S3();
+
+	// Initialize the S3 tokenizer.
+	const s3Tokenizer = await makeTokenizer(s3, {
+		Bucket: 'affectlab',
+		Key: '1min_35sec.mp4'
+	});
+
+	// Figure out what kind of file it is.
+	const fileType = await FileType.fromTokenizer(s3Tokenizer);
+	console.log(fileType);
+})();
+```
+
+Note that only the minimum amount of data required to determine the file type is read (okay, just a bit extra to prevent too many fragmented reads).
+
 #### tokenizer
 
 Type: [`ITokenizer`](https://github.com/Borewit/strtok3#tokenizer)
@@ -236,12 +259,6 @@ Returns a `Promise` which resolves to the original readable stream argument, but
 Type: [`stream.Readable`](https://nodejs.org/api/stream.html#stream_class_stream_readable)
 
 The input stream.
-
-### FileType.minimumBytes
-
-Type: `number`
-
-The minimum amount of bytes needed to detect a file type. Currently, it's 4100 bytes, but it can change, so don't hardcode it.
 
 ### FileType.extensions
 
@@ -374,10 +391,19 @@ Returns a set of supported MIME types.
 - [`shp`](https://en.wikipedia.org/wiki/Shapefile) - Geospatial vector data format
 - [`arrow`](https://arrow.apache.org) - Columnar format for tables of data
 - [`aac`](https://en.wikipedia.org/wiki/Advanced_Audio_Coding) - Advanced Audio Coding
+- [`it`](https://wiki.openmpt.org/Manual:_Module_formats#The_Impulse_Tracker_format_.28.it.29) - Audio module format: Impulse Tracker
+- [`s3m`](https://wiki.openmpt.org/Manual:_Module_formats#The_ScreamTracker_3_format_.28.s3m.29) - Audio module format: ScreamTracker 3
+- [`xm`](https://wiki.openmpt.org/Manual:_Module_formats#The_FastTracker_2_format_.28.xm.29) - Audio module format: FastTracker 2
+- [`ai`](https://en.wikipedia.org/wiki/Adobe_Illustrator_Artwork) - Adobe Illustrator Artwork
 
-*SVG isn't included as it requires the whole file to be read, but you can get it [here](https://github.com/sindresorhus/is-svg).*
+*Pull requests are welcome for additional commonly used file types.*
 
-*Pull requests are welcome for additional commonly used file types, except for `doc`, `xls`, `ppt`.*
+The following file types will not be accepted:
+- `.doc` - Too old and difficult to parse.
+- `.xls` - Too old and difficult to parse.
+- `.ppt` - Too old and difficult to parse.
+- `.csv` - [Reason.](https://github.com/sindresorhus/file-type/issues/264#issuecomment-568439196)
+- `.svg` - Detecting it requires a full-blown parser. Check out [`is-svg`](https://github.com/sindresorhus/is-svg) for something that mostly works.
 
 ## file-type for enterprise
 
@@ -394,4 +420,4 @@ The maintainers of file-type and thousands of other packages are working with Ti
 - [Sindre Sorhus](https://github.com/sindresorhus)
 - [Mikael Finstad](https://github.com/mifi)
 - [Ben Brook](https://github.com/bencmbrook)
-- [@Borewit](https://github.com/Borewit)
+- [Borewit](https://github.com/Borewit)

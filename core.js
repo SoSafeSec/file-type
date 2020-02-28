@@ -9,7 +9,7 @@ const {
 } = require('./util');
 const supported = require('./supported');
 
-const minimumBytes = 4100;
+const minimumBytes = 4100; // A fair amount of file-types are detectable within this range
 
 async function fromStream(stream) {
 	const tokenizer = await strtok3.fromStream(stream);
@@ -20,7 +20,7 @@ async function fromStream(stream) {
 	}
 }
 
-function fromBuffer(input) {
+async function fromBuffer(input) {
 	if (!(input instanceof Uint8Array || input instanceof ArrayBuffer || Buffer.isBuffer(input))) {
 		throw new TypeError(`Expected the \`input\` argument to be of type \`Uint8Array\` or \`Buffer\` or \`ArrayBuffer\`, got \`${typeof input}\``);
 	}
@@ -63,7 +63,26 @@ function _check(buffer, headers, options) {
 	return true;
 }
 
+async function _checkSequence(sequence, tokenizer, ignoreBytes) {
+	const buffer = Buffer.alloc(minimumBytes);
+	await tokenizer.ignore(ignoreBytes);
+
+	await tokenizer.peekBuffer(buffer, {mayBeLess: true});
+
+	return buffer.includes(Buffer.from(sequence));
+}
+
 async function fromTokenizer(tokenizer) {
+	try {
+		return _fromTokenizer(tokenizer);
+	} catch (error) {
+		if (!(error instanceof strtok3.EndOfStreamError)) {
+			throw error;
+		}
+	}
+}
+
+async function _fromTokenizer(tokenizer) {
 	let buffer = Buffer.alloc(minimumBytes);
 	const bytesRead =  tokenizer.fileInfo.size > 12 ? 12 :  tokenizer.fileInfo.size;
 	if(bytesRead === 0) return {
@@ -72,8 +91,15 @@ async function fromTokenizer(tokenizer) {
 	};
 	const check = (header, options) => _check(buffer, header, options);
 	const checkString = (header, options) => check(stringToBytes(header), options);
+	const checkSequence = (sequence, ignoreBytes) => _checkSequence(sequence, tokenizer, ignoreBytes);
 	const find = (tofind) => _find(buffer, tofind);
-	await tokenizer.peekBuffer(buffer, 0, bytesRead);
+	
+	// Keep reading until EOF if the file size is unknown.
+	if (!tokenizer.fileInfo.size) {
+		tokenizer.fileInfo.size = Number.MAX_SAFE_INTEGER;
+	}
+
+	await tokenizer.peekBuffer(buffer, {length: bytesRead, mayBeLess: true});
 
 	// -- 2-byte signatures --
 
@@ -233,95 +259,101 @@ async function fromTokenizer(tokenizer) {
 	// Zip-based file formats
 	// Need to be before the `zip` check
 	if (check([0x50, 0x4B, 0x3, 0x4])) { // Local file header signature
-		while (tokenizer.position < tokenizer.fileInfo.size) {
-			await tokenizer.readBuffer(buffer, 0, 30);
+		try {
+			while (tokenizer.position + 30 < tokenizer.fileInfo.size) {
+				await tokenizer.readBuffer(buffer, {length: 30});
 
-			// https://en.wikipedia.org/wiki/Zip_(file_format)#File_headers
-			const zipHeader = {
-				compressedSize: buffer.readUInt32LE(18),
-				uncompressedSize: buffer.readUInt32LE(22),
-				filenameLength: buffer.readUInt16LE(26),
-				extraFieldLength: buffer.readUInt16LE(28)
-			};
-
-			zipHeader.filename = await tokenizer.readToken(new Token.StringType(zipHeader.filenameLength, 'utf-8'));
-			await tokenizer.ignore(zipHeader.extraFieldLength);
-
-			// Assumes signed `.xpi` from addons.mozilla.org
-			if (zipHeader.filename === 'META-INF/mozilla.rsa') {
-				return {
-					ext: 'xpi',
-					mime: 'application/x-xpinstall'
+				// https://en.wikipedia.org/wiki/Zip_(file_format)#File_headers
+				const zipHeader = {
+					compressedSize: buffer.readUInt32LE(18),
+					uncompressedSize: buffer.readUInt32LE(22),
+					filenameLength: buffer.readUInt16LE(26),
+					extraFieldLength: buffer.readUInt16LE(28)
 				};
-			}
 
-			if (zipHeader.filename.endsWith('.rels')) {
-				const type = zipHeader.filename.split('/')[0];
-				switch (type) {
-					case '_rels':
-						break;
-					case 'word':
-						return {
-							ext: 'docx',
-							mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-						};
-					case 'ppt':
-						return {
-							ext: 'pptx',
-							mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-						};
-					case 'xl':
-						return {
-							ext: 'xlsx',
-							mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-						};
-					default:
-						return;
+				zipHeader.filename = await tokenizer.readToken(new Token.StringType(zipHeader.filenameLength, 'utf-8'));
+				await tokenizer.ignore(zipHeader.extraFieldLength);
+
+				// Assumes signed `.xpi` from addons.mozilla.org
+				if (zipHeader.filename === 'META-INF/mozilla.rsa') {
+					return {
+						ext: 'xpi',
+						mime: 'application/x-xpinstall'
+					};
 				}
-			}
 
-			if (zipHeader.filename.startsWith('xl/')) {
-				return {
-					ext: 'xlsx',
-					mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-				};
-			}
-
-			// The docx, xlsx and pptx file types extend the Office Open XML file format:
-			// https://en.wikipedia.org/wiki/Office_Open_XML_file_formats
-			// We look for:
-			// - one entry named '[Content_Types].xml' or '_rels/.rels',
-			// - one entry indicating specific type of file.
-			// MS Office, OpenOffice and LibreOffice may put the parts in different order, so the check should not rely on it.
-			if (zipHeader.filename === 'mimetype' && zipHeader.compressedSize === zipHeader.uncompressedSize) {
-				const mimeType = await tokenizer.readToken(new Token.StringType(zipHeader.compressedSize, 'utf-8'));
-
-				switch (mimeType) {
-					case 'application/epub+zip':
-						return {
-							ext: 'epub',
-							mime: 'application/epub+zip'
-						};
-					case 'application/vnd.oasis.opendocument.text':
-						return {
-							ext: 'odt',
-							mime: 'application/vnd.oasis.opendocument.text'
-						};
-					case 'application/vnd.oasis.opendocument.spreadsheet':
-						return {
-							ext: 'ods',
-							mime: 'application/vnd.oasis.opendocument.spreadsheet'
-						};
-					case 'application/vnd.oasis.opendocument.presentation':
-						return {
-							ext: 'odp',
-							mime: 'application/vnd.oasis.opendocument.presentation'
-						};
-					default:
+				if (zipHeader.filename.endsWith('.rels') || zipHeader.filename.endsWith('.xml')) {
+					const type = zipHeader.filename.split('/')[0];
+					switch (type) {
+						case '_rels':
+							break;
+						case 'word':
+							return {
+								ext: 'docx',
+								mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+							};
+						case 'ppt':
+							return {
+								ext: 'pptx',
+								mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+							};
+						case 'xl':
+							return {
+								ext: 'xlsx',
+								mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+							};
+						default:
+							break;
+					}
 				}
-			}
 
-			await tokenizer.ignore(zipHeader.compressedSize);
+				if (zipHeader.filename.startsWith('xl/')) {
+					return {
+						ext: 'xlsx',
+						mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+					};
+				}
+
+				// The docx, xlsx and pptx file types extend the Office Open XML file format:
+				// https://en.wikipedia.org/wiki/Office_Open_XML_file_formats
+				// We look for:
+				// - one entry named '[Content_Types].xml' or '_rels/.rels',
+				// - one entry indicating specific type of file.
+				// MS Office, OpenOffice and LibreOffice may put the parts in different order, so the check should not rely on it.
+				if (zipHeader.filename === 'mimetype' && zipHeader.compressedSize === zipHeader.uncompressedSize) {
+					const mimeType = await tokenizer.readToken(new Token.StringType(zipHeader.compressedSize, 'utf-8'));
+
+					switch (mimeType) {
+						case 'application/epub+zip':
+							return {
+								ext: 'epub',
+								mime: 'application/epub+zip'
+							};
+						case 'application/vnd.oasis.opendocument.text':
+							return {
+								ext: 'odt',
+								mime: 'application/vnd.oasis.opendocument.text'
+							};
+						case 'application/vnd.oasis.opendocument.spreadsheet':
+							return {
+								ext: 'ods',
+								mime: 'application/vnd.oasis.opendocument.spreadsheet'
+							};
+						case 'application/vnd.oasis.opendocument.presentation':
+							return {
+								ext: 'odp',
+								mime: 'application/vnd.oasis.opendocument.presentation'
+							};
+						default:
+					}
+				}
+
+				await tokenizer.ignore(zipHeader.compressedSize);
+			}
+		} catch (error) {
+			if (!(error instanceof strtok3.EndOfStreamError)) {
+				throw error;
+			}
 		}
 
 		return {
@@ -447,7 +479,7 @@ async function fromTokenizer(tokenizer) {
 			case 'F4B':
 				return {ext: 'f4b', mime: 'audio/mp4'};
 			case 'crx':
-				return {ext: 'cr3',	mime: 'image/x-canon-cr3'};
+				return {ext: 'cr3', mime: 'image/x-canon-cr3'};
 			default:
 				if (brandMajor.startsWith('3g')) {
 					if (brandMajor.startsWith('3g2')) {
@@ -538,6 +570,16 @@ async function fromTokenizer(tokenizer) {
 	}
 
 	if (checkString('%PDF')) {
+		// Check if this is an Adobe Illustrator file
+		const isAiFile = await checkSequence('Adobe Illustrator', 1350);
+		if (isAiFile) {
+			return {
+				ext: 'ai',
+				mime: 'application/postscript'
+			};
+		}
+
+		// Assume this is just a normal PDF
 		return {
 			ext: 'pdf',
 			mime: 'application/pdf'
@@ -551,7 +593,8 @@ async function fromTokenizer(tokenizer) {
 		};
 	}
 
-	if (check([0x49, 0x49, 0x2A, 0x0] || [0x4D, 0x4D, 0x0, 0x2A])) {
+	// TIFF, little-endian type
+	if (check([0x49, 0x49, 0x2A, 0x0])) {
 		if (checkString('CR', {offset: 8})) {
 			return {
 				ext: 'cr2',
@@ -596,9 +639,8 @@ async function fromTokenizer(tokenizer) {
 		};
 	}
 
-	if (
-		check([0x4D, 0x4D, 0x0, 0x2A])
-	) {
+	// TIFF, big-endian type
+	if (check([0x4D, 0x4D, 0x0, 0x2A])) {
 		return {
 			ext: 'tif',
 			mime: 'image/tiff'
@@ -766,6 +808,32 @@ async function fromTokenizer(tokenizer) {
 		};
 	}
 
+	if (checkString('IMPM')) {
+		return {
+			ext: 'it',
+			mime: 'audio/x-it'
+		};
+	}
+
+	// MPEG program stream (PS or MPEG-PS)
+	if (check([0x00, 0x00, 0x01, 0xBA])) {
+		//  MPEG-PS, MPEG-1 Part 1
+		if (check([0x21], {offset: 4, mask: [0xF1]})) {
+			return {
+				ext: 'mpg', // May also be .ps, .mpeg
+				mime: 'video/MP1S'
+			};
+		}
+
+		// MPEG-PS, MPEG-2 Part 1
+		if (check([0x44], {offset: 4, mask: [0xC4]})) {
+			return {
+				ext: 'mpg', // May also be .mpg, .m2p, .vob or .sub
+				mime: 'video/MP2P'
+			};
+		}
+	}
+
 	// -- 6-byte signatures --
 
 	if (check([0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00])) {
@@ -868,6 +936,11 @@ async function fromTokenizer(tokenizer) {
 					await tokenizer.ignore(chunk.length + 4); // Ignore chunk-data + CRC
 			}
 		} while (tokenizer.position < tokenizer.fileInfo.size);
+
+		return {
+			ext: 'png',
+			mime: 'image/png'
+		};
 	}
 
 	if (check([0x41, 0x52, 0x52, 0x4F, 0x57, 0x31, 0x00, 0x00])) {
@@ -1051,13 +1124,20 @@ async function fromTokenizer(tokenizer) {
 	}
 
 	// Increase sample size from 12 to 256.
-	await tokenizer.peekBuffer(buffer, 0, Math.min(256, tokenizer.fileInfo.size));
+	await tokenizer.peekBuffer(buffer, {length: Math.min(256, tokenizer.fileInfo.size), mayBeLess: true});
 
 	// `raf` is here just to keep all the raw image detectors together.
 	if (checkString('FUJIFILMCCD-RAW')) {
 		return {
 			ext: 'raf',
 			mime: 'image/x-fujifilm-raf'
+		};
+	}
+
+	if (checkString('Extended Module:')) {
+		return {
+			ext: 'xm',
+			mime: 'audio/x-xm'
 		};
 	}
 
@@ -1097,6 +1177,13 @@ async function fromTokenizer(tokenizer) {
 		return {
 			ext: 'mxf',
 			mime: 'application/mxf'
+		};
+	}
+
+	if (checkString('SCRM', {offset: 44})) {
+		return {
+			ext: 's3m',
+			mime: 'audio/x-s3m'
 		};
 	}
 
@@ -1150,7 +1237,7 @@ async function fromTokenizer(tokenizer) {
 	}
 
 	// Increase sample size from 256 to 512
-	await tokenizer.peekBuffer(buffer, 0, Math.min(512, tokenizer.fileInfo.size));
+	await tokenizer.peekBuffer(buffer, {length: Math.min(512, tokenizer.fileInfo.size), mayBeLess: true});
 
 	if (
 		check([0x30, 0x30, 0x30, 0x30, 0x30, 0x30], {offset: 148, mask: [0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8]}) && // Valid tar checksum
@@ -1216,8 +1303,17 @@ const stream = readableStream => new Promise((resolve, reject) => {
 
 	readableStream.on('error', reject);
 	readableStream.once('readable', async () => {
+		// Set up output stream
 		const pass = new stream.PassThrough();
-		const chunk = readableStream.read(fileType.minimumBytes) || readableStream.read();
+		let outputStream;
+		if (stream.pipeline) {
+			outputStream = stream.pipeline(readableStream, pass, () => {});
+		} else {
+			outputStream = readableStream.pipe(pass);
+		}
+
+		// Read the input stream and detect the filetype
+		const chunk = readableStream.read(minimumBytes) || readableStream.read() || Buffer.alloc(0);
 		try {
 			const fileType = await fromBuffer(chunk);
 			pass.fileType = fileType;
@@ -1225,14 +1321,7 @@ const stream = readableStream => new Promise((resolve, reject) => {
 			reject(error);
 		}
 
-		readableStream.unshift(chunk);
-
-		if (stream.pipeline) {
-			resolve(stream.pipeline(readableStream, pass, () => {
-			}));
-		} else {
-			resolve(readableStream.pipe(pass));
-		}
+		resolve(outputStream);
 	});
 });
 
@@ -1240,8 +1329,7 @@ const fileType = {
 	fromStream,
 	fromTokenizer,
 	fromBuffer,
-	stream,
-	minimumBytes: 4100
+	stream
 };
 
 Object.defineProperty(fileType, 'extensions', {

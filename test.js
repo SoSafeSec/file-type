@@ -2,17 +2,12 @@ import path from 'path';
 import fs from 'fs';
 import stream from 'stream';
 import test from 'ava';
-import readChunk from 'read-chunk';
-import pify from 'pify';
 import {readableNoopStream} from 'noop-stream';
 import FileType from '.';
 
 const supported = require('./supported');
 
 const missingTests = [
-	'asf',
-	'ogm',
-	'ogx',
 	'mpc'
 ];
 
@@ -104,7 +99,9 @@ const names = {
 	],
 	mpg: [
 		'fixture',
-		'fixture2'
+		'fixture2',
+		'fixture.ps',
+		'fixture.sub'
 	],
 	heic: [
 		'fixture-mif1',
@@ -122,6 +119,10 @@ const names = {
 		'fixture-big-endian',
 		'fixture-little-endian'
 	],
+	png: [
+		'fixture',
+		'fixture-itxt'
+	],
 	tar: [
 		'fixture',
 		'fixture-v7'
@@ -136,14 +137,23 @@ const names = {
 	flac: [
 		'fixture',
 		'fixture-id3v2' // FLAC prefixed with ID3v2 header
+	],
+	docx: [
+		'fixture',
+		'fixture-office365'
+	],
+	pptx: [
+		'fixture',
+		'fixture-office365'
+	],
+	xlsx: [
+		'fixture',
+		'fixture-office365'
+	],
+	ogx: [
+		'fixture-unknown-ogg' // Manipulated fixture to unrecognized Ogg based file
 	]
 };
-
-// Following types cannot be detected within 4k sample size boundary
-const cannotDetectInBuffer = [
-	'fixture-id3v2.aac',
-	'fixture-id3v2.flac'
-];
 
 // Define an entry here only if the file type has potential
 // for false-positives
@@ -154,6 +164,11 @@ const falsePositives = {
 		'fixture-xls'
 	]
 };
+
+// Known failing fixture
+const failingFixture = [
+	'fixture.asf'
+];
 
 async function checkBufferLike(t, type, bufferLike) {
 	const {ext, mime} = await FileType.fromBuffer(bufferLike) || {};
@@ -176,76 +191,72 @@ async function testFromBuffer(t, ext, name) {
 	const fixtureName = `${(name || 'fixture')}.${ext}`;
 
 	const file = path.join(__dirname, 'fixture', fixtureName);
-	const chunk = readChunk.sync(file, 0, 4 + 4096);
+	const chunk = fs.readFileSync(file);
 	await checkBufferLike(t, ext, chunk);
 	await checkBufferLike(t, ext, new Uint8Array(chunk));
-	await checkBufferLike(t, ext, chunk.buffer);
+	await checkBufferLike(t, ext, chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
 }
 
-const testFalsePositive = async (t, ext, name) => {
+async function testFalsePositive(t, ext, name) {
 	const file = path.join(__dirname, 'fixture', `${name}.${ext}`);
-	const chunk = readChunk.sync(file, 0, 4 + 4096);
+	const chunk = fs.readFileSync(file);
 
 	t.is(await FileType.fromBuffer(chunk), undefined);
 	t.is(await FileType.fromBuffer(new Uint8Array(chunk)), undefined);
 	t.is(await FileType.fromBuffer(chunk.buffer), undefined);
-};
+}
 
-const testFileFromStream = async (t, ext, name) => {
-	const file = path.join(__dirname, 'fixture', `${(name || 'fixture')}.${ext}`);
-	const readableStream = await FileType.stream(fs.createReadStream(file));
+async function testFileFromStream(t, ext, name) {
+	const filename = `${(name || 'fixture')}.${ext}`;
+	const file = path.join(__dirname, 'fixture', filename);
+	const fileType = await FileType.fromStream(fs.createReadStream(file));
 
-	const _fileType = await FileType.fromBuffer(readChunk.sync(file, 0, FileType.minimumBytes));
-	t.deepEqual(readableStream.fileType, _fileType);
-};
+	t.truthy(fileType, `identify ${filename}`);
+	t.is(fileType.ext, ext, 'fileType.ext');
+	t.is(typeof fileType.mime, 'string', 'fileType.mime');
+}
 
-const testStream = async (t, ext, name) => {
+async function loadEntireFile(readable) {
+	const buffer = [];
+	readable.on('data', chunk => {
+		buffer.push(Buffer.from(chunk));
+	});
+
+	await new Promise(resolve => readable.on('end', resolve));
+	return Buffer.concat(buffer);
+}
+
+async function testStream(t, ext, name) {
 	const fixtureName = `${(name || 'fixture')}.${ext}`;
 	const file = path.join(__dirname, 'fixture', fixtureName);
 
 	const readableStream = await FileType.stream(fs.createReadStream(file));
 	const fileStream = fs.createReadStream(file);
 
-	const loadEntireFile = async readable => {
-		const buffer = [];
-		readable.on('data', chunk => {
-			buffer.push(Buffer.from(chunk));
-		});
-
-		if (stream.finished) {
-			const finished = pify(stream.finished);
-			await finished(readable);
-		} else {
-			await new Promise(resolve => readable.on('end', resolve));
-		}
-
-		return Buffer.concat(buffer);
-	};
-
 	const [bufferA, bufferB] = await Promise.all([loadEntireFile(readableStream), loadEntireFile(fileStream)]);
 
 	t.true(bufferA.equals(bufferB));
-};
+}
 
 let i = 0;
 for (const type of types) {
 	if (Object.prototype.hasOwnProperty.call(names, type)) {
 		for (const name of names[type]) {
 			const fixtureName = `${name}.${type}`;
-			const test4k = cannotDetectInBuffer.includes(fixtureName) ? test.failing : test;
+			const _test = failingFixture.includes(fixtureName) ? test.failing : test;
 
-			test(`${name}.${type} ${i++} .fromFile() method - same fileType`, testFromFile, type, name);
-			test4k(`${name}.${type} ${i++} .fromBuffer() method - same fileType`, testFromBuffer, type, name);
-			test(`${name}.${type} ${i++} .fromStream() method - same fileType`, testFileFromStream, type, name);
+			_test(`${name}.${type} ${i++} .fromFile() method - same fileType`, testFromFile, type, name);
+			_test(`${name}.${type} ${i++} .fromBuffer() method - same fileType`, testFromBuffer, type, name);
+			_test(`${name}.${type} ${i++} .fromStream() method - same fileType`, testFileFromStream, type, name);
 			test(`${name}.${type} ${i++} .stream() - identical streams`, testStream, type, name);
 		}
 	} else {
 		const fixtureName = `fixture.${type}`;
-		const test4k = cannotDetectInBuffer.includes(fixtureName) ? test.failing : test;
+		const _test = failingFixture.includes(fixtureName) ? test.failing : test;
 
-		test(`${type} ${i++} .fromFile()`, testFromFile, type);
-		test4k(`${type} ${i++} .fromBuffer()`, testFromBuffer, type);
-		test(`${type} ${i++} .fromStream()`, testFileFromStream, type);
+		_test(`${type} ${i++} .fromFile()`, testFromFile, type);
+		_test(`${type} ${i++} .fromBuffer()`, testFromBuffer, type);
+		_test(`${type} ${i++} .fromStream()`, testFileFromStream, type);
 		test(`${type} ${i++} .stream() - identical streams`, testStream, type);
 	}
 
@@ -257,10 +268,27 @@ for (const type of types) {
 }
 
 test('.stream() method - empty stream', async t => {
-	await t.throwsAsync(
-		FileType.stream(readableNoopStream()),
-		/Expected the `input` argument to be of type `Uint8Array` /
-	);
+	const newStream = await FileType.stream(readableNoopStream());
+	t.is(newStream.fileType, undefined);
+});
+
+test('.stream() method - short stream', async t => {
+	const bufferA = Buffer.from([0, 1, 0, 1]);
+	class MyStream extends stream.Readable {
+		_read() {
+			this.push(bufferA);
+			this.push(null);
+		}
+	}
+
+	// Test filetype detection
+	const shortStream = new MyStream();
+	const newStream = await FileType.stream(shortStream);
+	t.is(newStream.fileType, undefined);
+
+	// Test usability of returned stream
+	const bufferB = await loadEntireFile(newStream);
+	t.deepEqual(bufferA, bufferB);
 });
 
 test('.stream() method - error event', async t => {
@@ -277,10 +305,6 @@ test('.stream() method - error event', async t => {
 	await t.throwsAsync(FileType.stream(readableStream), errorMessage);
 });
 
-test('FileType.minimumBytes', t => {
-	t.true(FileType.minimumBytes > 4000);
-});
-
 test('FileType.extensions.has', t => {
 	t.true(FileType.extensions.has('jpg'));
 	t.false(FileType.extensions.has('blah'));
@@ -292,21 +316,14 @@ test('FileType.mimeTypes.has', t => {
 });
 
 test('validate the input argument type', async t => {
-	await t.throwsAsync(async () => {
-		await FileType.fromBuffer('x');
-	}, /Expected the `input` argument to be of type `Uint8Array`/);
+	await t.throwsAsync(FileType.fromBuffer('x'),
+		/Expected the `input` argument to be of type `Uint8Array`/);
 
-	await t.notThrowsAsync(async () => {
-		await FileType.fromBuffer(Buffer.from('x'));
-	});
+	await t.notThrowsAsync(FileType.fromBuffer(Buffer.from('x')));
 
-	await t.notThrowsAsync(async () => {
-		await FileType.fromBuffer(new Uint8Array());
-	});
+	await t.notThrowsAsync(FileType.fromBuffer(new Uint8Array()));
 
-	await t.notThrowsAsync(async () => {
-		await FileType.fromBuffer(new ArrayBuffer());
-	});
+	await t.notThrowsAsync(FileType.fromBuffer(new ArrayBuffer()));
 });
 
 test('validate the repo has all extensions and mimes in sync', t => {
@@ -452,5 +469,14 @@ test('validate the repo has all extensions and mimes in sync', t => {
 			const foundMimeTypes = filesWithMimeTypes[fileName];
 			validate(foundMimeTypes, mimes, fileName, 'mimes');
 		}
+	}
+});
+
+test('odd file sizes', async t => {
+	const oddFileSizes = [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 255, 256, 257, 511, 512, 513];
+
+	for (const size of oddFileSizes) {
+		const buffer = Buffer.alloc(size);
+		await t.notThrowsAsync(FileType.fromBuffer(buffer), `File size: ${size} bytes`);
 	}
 });

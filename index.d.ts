@@ -20,7 +20,7 @@ export function fromFile(path: string): Promise<core.FileTypeResult | undefined>
 export {
 	fromBuffer,
 	fromStream,
-	minimumBytes,
+	fromTokenizer,
 	extensions,
 	mimeTypes,
 	stream

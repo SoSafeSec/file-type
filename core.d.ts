@@ -124,7 +124,11 @@ declare namespace core {
 		| 'arrow'
 		| 'shp'
 		| 'aac'
-		| 'mp1';
+		| 'mp1'
+		| 'it'
+		| 's3m'
+		| 'xm'
+		| 'ai';
 
 	type MimeType =
 		| 'image/jpeg'
@@ -239,7 +243,12 @@ declare namespace core {
 		| 'video/x-m4v'
 		| 'video/3gpp2'
 		| 'application/x-esri-shape'
-		| 'audio/aac';
+		| 'audio/aac'
+		| 'audio/x-it'
+		| 'audio/x-s3m'
+		| 'audio/x-xm'
+		| 'video/MP1S'
+		| 'video/MP2P';
 
 	interface FileTypeResult {
 		/**
@@ -307,11 +316,6 @@ declare namespace core {
 	@returns The detected file type and MIME type, or `undefined` when there is no match.
 	*/
 	function fromTokenizer(tokenizer: ITokenizer): Promise<core.FileTypeResult | undefined>;
-
-	/**
-	Deprecated: The minimum amount of bytes needed to detect a file type. Currently, it's 4100 bytes, but it can change, so don't hard-code it.
-	*/
-	const minimumBytes: number;
 
 	/**
 	Supported file extensions.
