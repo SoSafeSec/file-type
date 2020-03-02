@@ -303,8 +303,6 @@ async function _fromTokenizer(tokenizer) {
 					extraFieldLength: windowBuffer.readUInt16LE(position + 28)
 				};
 
-
-				console.dir(zipHeader);
 				const filenameLength = zipHeader.filenameLength;
 				const beginingOfFileName = position + 30;
 
@@ -322,7 +320,6 @@ async function _fromTokenizer(tokenizer) {
 
 				const filenameBuffer = windowBuffer.subarray(beginingOfFileName, beginingOfFileName + filenameLength);
 				const filename = filenameBuffer.toString('utf8');
-				console.log("FILENAME: " + filename + "END " + filenameBuffer.toString('hex'));
 
 				if (filename === 'META-INF/mozilla.rsa') {
 					return {
