@@ -20,6 +20,18 @@ async function fromStream(stream) {
 	}
 }
 
+function _find_indices(buffer, headers) {
+	const headerBuf = Buffer.from(headers);
+	let indices = [];
+	let lastIndex = -1;
+	while (lastIndex + 1 < buffer.length) {
+		lastIndex = buffer.indexOf(headerBuf, lastIndex + 1);
+		if (lastIndex === -1) break;
+		indices.push(lastIndex);
+	}
+	return indices;
+}
+
 async function fromBuffer(input) {
 	if (!(input instanceof Uint8Array || input instanceof ArrayBuffer || Buffer.isBuffer(input))) {
 		throw new TypeError(`Expected the \`input\` argument to be of type \`Uint8Array\` or \`Buffer\` or \`ArrayBuffer\`, got \`${typeof input}\``);
@@ -36,8 +48,8 @@ async function fromBuffer(input) {
 }
 
 function _find(buffer, headers) {
-	const strBuf = new Buffer(buffer).toString('hex');
-	const strHea = new Buffer(headers).toString('hex');
+	const strBuf = Buffer.from(buffer).toString('hex');
+	const strHea = Buffer.from(headers).toString('hex');
 	let regex = new RegExp(`${strHea}`, "g");
 	return regex.exec(strBuf) || false;
 }
@@ -67,7 +79,7 @@ async function _checkSequence(sequence, tokenizer, ignoreBytes) {
 	const buffer = Buffer.alloc(minimumBytes);
 	await tokenizer.ignore(ignoreBytes);
 
-	await tokenizer.peekBuffer(buffer, {mayBeLess: true});
+	await tokenizer.peekBuffer(buffer, { mayBeLess: true });
 
 	return buffer.includes(Buffer.from(sequence));
 }
@@ -84,8 +96,8 @@ async function fromTokenizer(tokenizer) {
 
 async function _fromTokenizer(tokenizer) {
 	let buffer = Buffer.alloc(minimumBytes);
-	const bytesRead =  tokenizer.fileInfo.size > 12 ? 12 :  tokenizer.fileInfo.size;
-	if(bytesRead === 0) return {
+	const bytesRead = tokenizer.fileInfo.size > 12 ? 12 : tokenizer.fileInfo.size;
+	if (bytesRead === 0) return {
 		ext: '',
 		mime: 'example/example'
 	};
@@ -93,13 +105,13 @@ async function _fromTokenizer(tokenizer) {
 	const checkString = (header, options) => check(stringToBytes(header), options);
 	const checkSequence = (sequence, ignoreBytes) => _checkSequence(sequence, tokenizer, ignoreBytes);
 	const find = (tofind) => _find(buffer, tofind);
-	
+
 	// Keep reading until EOF if the file size is unknown.
 	if (!tokenizer.fileInfo.size) {
 		tokenizer.fileInfo.size = Number.MAX_SAFE_INTEGER;
 	}
 
-	await tokenizer.peekBuffer(buffer, {length: bytesRead, mayBeLess: true});
+	await tokenizer.peekBuffer(buffer, { length: bytesRead, mayBeLess: true });
 
 	// -- 2-byte signatures --
 
@@ -203,7 +215,7 @@ async function _fromTokenizer(tokenizer) {
 
 	if (
 		(buffer[0] === 0x43 || buffer[0] === 0x46) &&
-		check([0x57, 0x53], {offset: 1})
+		check([0x57, 0x53], { offset: 1 })
 	) {
 		return {
 			ext: 'swf',
@@ -234,7 +246,7 @@ async function _fromTokenizer(tokenizer) {
 		};
 	}
 
-	if (checkString('WEBP', {offset: 8})) {
+	if (checkString('WEBP', { offset: 8 })) {
 		return {
 			ext: 'webp',
 			mime: 'image/webp'
@@ -259,31 +271,68 @@ async function _fromTokenizer(tokenizer) {
 	// Zip-based file formats
 	// Need to be before the `zip` check
 	if (check([0x50, 0x4B, 0x3, 0x4])) { // Local file header signature
-		try {
-			while (tokenizer.position + 30 < tokenizer.fileInfo.size) {
-				await tokenizer.readBuffer(buffer, {length: 30});
+		const change = 10;
+		let lastBuffer = Buffer.from([]);
+		let windowBuffer = Buffer.from([]);
+		let lastposition = 0;
 
-				// https://en.wikipedia.org/wiki/Zip_(file_format)#File_headers
+		while (tokenizer.position + change <= tokenizer.fileInfo.size) {
+			let bytesread = await tokenizer.readBuffer(buffer, { length: change, mayBeLess: true });
+			let newBuffer = buffer.subarray(0, bytesread);
+			windowBuffer = Buffer.concat([lastBuffer, newBuffer]);
+
+			const indices = _find_indices(windowBuffer, [0x50, 0x4B, 0x03, 0x04]);
+			for (let i = 0; i < indices.length; i++) {
+				const position = indices[i];
+				const diffHeader = position + 30 - windowBuffer.length;
+				let appendBuffer = null;
+				let appendedBytes = 0;
+				if (diffHeader > 0) {
+					appendBuffer = Buffer.alloc(diffHeader + 1);
+					appendedBytes = await tokenizer.readBuffer(appendBuffer, { length: diffHeader, mayBeLess: true });
+					if (appendedBytes < diffHeader) continue;
+					windowBuffer = Buffer.concat([windowBuffer, appendBuffer.subarray(0, appendedBytes)]);
+				}
+
+				if (windowBuffer.length < position + 30) continue;
+
 				const zipHeader = {
-					compressedSize: buffer.readUInt32LE(18),
-					uncompressedSize: buffer.readUInt32LE(22),
-					filenameLength: buffer.readUInt16LE(26),
-					extraFieldLength: buffer.readUInt16LE(28)
+					compressedSize: windowBuffer.readUInt32LE(position + 18),
+					uncompressedSize: windowBuffer.readUInt32LE(position + 22),
+					filenameLength: windowBuffer.readUInt16LE(position + 26),
+					extraFieldLength: windowBuffer.readUInt16LE(position + 28)
 				};
 
-				zipHeader.filename = await tokenizer.readToken(new Token.StringType(zipHeader.filenameLength, 'utf-8'));
-				await tokenizer.ignore(zipHeader.extraFieldLength);
 
-				// Assumes signed `.xpi` from addons.mozilla.org
-				if (zipHeader.filename === 'META-INF/mozilla.rsa') {
+				console.dir(zipHeader);
+				const filenameLength = zipHeader.filenameLength;
+				const beginingOfFileName = position + 30;
+
+
+				const diffFileName = beginingOfFileName + filenameLength - windowBuffer.length;
+				appendBuffer = null;
+				if (diffFileName > 0) {
+					appendBuffer = Buffer.alloc(diffFileName + 1);
+					appendedBytes = await tokenizer.readBuffer(appendBuffer, { length: diffFileName, mayBeLess: true });
+					if (appendedBytes < diffFileName) continue;
+					windowBuffer = Buffer.concat([windowBuffer, appendBuffer.subarray(0, appendedBytes)]);
+				}
+
+				if (windowBuffer.length < beginingOfFileName + filenameLength) continue;
+
+				const filenameBuffer = windowBuffer.subarray(beginingOfFileName, beginingOfFileName + filenameLength);
+				const filename = filenameBuffer.toString('utf8');
+				console.log("FILENAME: " + filename + "END " + filenameBuffer.toString('hex'));
+
+				if (filename === 'META-INF/mozilla.rsa') {
 					return {
 						ext: 'xpi',
 						mime: 'application/x-xpinstall'
 					};
 				}
 
-				if (zipHeader.filename.endsWith('.rels') || zipHeader.filename.endsWith('.xml')) {
-					const type = zipHeader.filename.split('/')[0];
+				if (filename.endsWith('.rels') || filename.endsWith('.xml')) {
+					const type = filename.split('/')[0];
 					switch (type) {
 						case '_rels':
 							break;
@@ -307,12 +356,15 @@ async function _fromTokenizer(tokenizer) {
 					}
 				}
 
-				if (zipHeader.filename.startsWith('xl/')) {
+				if (filename.startsWith('xl/')) {
 					return {
 						ext: 'xlsx',
 						mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 					};
 				}
+
+
+
 
 				// The docx, xlsx and pptx file types extend the Office Open XML file format:
 				// https://en.wikipedia.org/wiki/Office_Open_XML_file_formats
@@ -320,8 +372,21 @@ async function _fromTokenizer(tokenizer) {
 				// - one entry named '[Content_Types].xml' or '_rels/.rels',
 				// - one entry indicating specific type of file.
 				// MS Office, OpenOffice and LibreOffice may put the parts in different order, so the check should not rely on it.
-				if (zipHeader.filename === 'mimetype' && zipHeader.compressedSize === zipHeader.uncompressedSize) {
-					const mimeType = await tokenizer.readToken(new Token.StringType(zipHeader.compressedSize, 'utf-8'));
+
+				if (filename === 'mimetype' && zipHeader.compressedSize === zipHeader.uncompressedSize) {
+					const diffMimetype = beginingOfFileName + filenameLength + zipHeader.compressedSize - windowBuffer.length;
+					appendBuffer = null;
+					if (diffMimetype > 0) {
+						appendBuffer = Buffer.alloc(diffMimetype + 1);
+						appendedBytes = await tokenizer.readBuffer(appendBuffer, { length: diffMimetype, mayBeLess: true });
+						if (appendedBytes < diffMimetype) continue;
+						windowBuffer = Buffer.concat([windowBuffer, appendBuffer.subarray(0, appendedBytes)]);
+					}
+
+					if (windowBuffer.length < beginingOfFileName + filenameLength + zipHeader.compressedSize) continue;
+
+					const mimeTypeBuffer = windowBuffer.subarray(beginingOfFileName + filenameLength, beginingOfFileName + filenameLength + zipHeader.compressedSize);
+					const mimeType = mimeTypeBuffer.toString('utf8');
 
 					switch (mimeType) {
 						case 'application/epub+zip':
@@ -348,12 +413,10 @@ async function _fromTokenizer(tokenizer) {
 					}
 				}
 
-				await tokenizer.ignore(zipHeader.compressedSize);
-			}
-		} catch (error) {
-			if (!(error instanceof strtok3.EndOfStreamError)) {
-				throw error;
-			}
+				lastposition = position;
+			};
+
+			lastBuffer = windowBuffer.subarray(lastposition + 1, windowBuffer.length);
 		}
 
 		return {
@@ -441,7 +504,7 @@ async function _fromTokenizer(tokenizer) {
 	// `ftyp` box must contain a brand major identifier, which must consist of ISO 8859-1 printable characters.
 	// Here we check for 8859-1 printable characters (for simplicity, it's a mask which also catches one non-printable character).
 	if (
-		checkString('ftyp', {offset: 4}) &&
+		checkString('ftyp', { offset: 4 }) &&
 		(buffer[8] & 0x60) !== 0x00 // Brand major, first character ASCII?
 	) {
 		// They all can have MIME `video/mp4` except `application/mp4` special-case which is hard to detect.
@@ -449,47 +512,47 @@ async function _fromTokenizer(tokenizer) {
 		const brandMajor = uint8ArrayUtf8ByteString(buffer, 8, 12).replace('\0', ' ').trim();
 		switch (brandMajor) {
 			case 'mif1':
-				return {ext: 'heic', mime: 'image/heif'};
+				return { ext: 'heic', mime: 'image/heif' };
 			case 'msf1':
-				return {ext: 'heic', mime: 'image/heif-sequence'};
+				return { ext: 'heic', mime: 'image/heif-sequence' };
 			case 'heic':
 			case 'heix':
-				return {ext: 'heic', mime: 'image/heic'};
+				return { ext: 'heic', mime: 'image/heic' };
 			case 'hevc':
 			case 'hevx':
-				return {ext: 'heic', mime: 'image/heic-sequence'};
+				return { ext: 'heic', mime: 'image/heic-sequence' };
 			case 'qt':
-				return {ext: 'mov', mime: 'video/quicktime'};
+				return { ext: 'mov', mime: 'video/quicktime' };
 			case 'M4V':
 			case 'M4VH':
 			case 'M4VP':
-				return {ext: 'm4v', mime: 'video/x-m4v'};
+				return { ext: 'm4v', mime: 'video/x-m4v' };
 			case 'M4P':
-				return {ext: 'm4p', mime: 'video/mp4'};
+				return { ext: 'm4p', mime: 'video/mp4' };
 			case 'M4B':
-				return {ext: 'm4b', mime: 'audio/mp4'};
+				return { ext: 'm4b', mime: 'audio/mp4' };
 			case 'M4A':
-				return {ext: 'm4a', mime: 'audio/x-m4a'};
+				return { ext: 'm4a', mime: 'audio/x-m4a' };
 			case 'F4V':
-				return {ext: 'f4v', mime: 'video/mp4'};
+				return { ext: 'f4v', mime: 'video/mp4' };
 			case 'F4P':
-				return {ext: 'f4p', mime: 'video/mp4'};
+				return { ext: 'f4p', mime: 'video/mp4' };
 			case 'F4A':
-				return {ext: 'f4a', mime: 'audio/mp4'};
+				return { ext: 'f4a', mime: 'audio/mp4' };
 			case 'F4B':
-				return {ext: 'f4b', mime: 'audio/mp4'};
+				return { ext: 'f4b', mime: 'audio/mp4' };
 			case 'crx':
-				return {ext: 'cr3', mime: 'image/x-canon-cr3'};
+				return { ext: 'cr3', mime: 'image/x-canon-cr3' };
 			default:
 				if (brandMajor.startsWith('3g')) {
 					if (brandMajor.startsWith('3g2')) {
-						return {ext: '3g2', mime: 'video/3gpp2'};
+						return { ext: '3g2', mime: 'video/3gpp2' };
 					}
 
-					return {ext: '3gp', mime: 'video/3gpp'};
+					return { ext: '3gp', mime: 'video/3gpp' };
 				}
 
-				return {ext: 'mp4', mime: 'video/mp4'};
+				return { ext: 'mp4', mime: 'video/mp4' };
 		}
 	}
 
@@ -503,8 +566,8 @@ async function _fromTokenizer(tokenizer) {
 	if (
 		checkString('wOFF') &&
 		(
-			check([0x00, 0x01, 0x00, 0x00], {offset: 4}) ||
-			checkString('OTTO', {offset: 4})
+			check([0x00, 0x01, 0x00, 0x00], { offset: 4 }) ||
+			checkString('OTTO', { offset: 4 })
 		)
 	) {
 		return {
@@ -516,8 +579,8 @@ async function _fromTokenizer(tokenizer) {
 	if (
 		checkString('wOF2') &&
 		(
-			check([0x00, 0x01, 0x00, 0x00], {offset: 4}) ||
-			checkString('OTTO', {offset: 4})
+			check([0x00, 0x01, 0x00, 0x00], { offset: 4 }) ||
+			checkString('OTTO', { offset: 4 })
 		)
 	) {
 		return {
@@ -595,14 +658,14 @@ async function _fromTokenizer(tokenizer) {
 
 	// TIFF, little-endian type
 	if (check([0x49, 0x49, 0x2A, 0x0])) {
-		if (checkString('CR', {offset: 8})) {
+		if (checkString('CR', { offset: 8 })) {
 			return {
 				ext: 'cr2',
 				mime: 'image/x-canon-cr2'
 			};
 		}
 
-		if (check([0x1C, 0x00, 0xFE, 0x00], {offset: 8})) {
+		if (check([0x1C, 0x00, 0xFE, 0x00], { offset: 8 })) {
 			return {
 				ext: 'nef',
 				mime: 'image/x-nikon-nef'
@@ -610,9 +673,9 @@ async function _fromTokenizer(tokenizer) {
 		}
 
 		if (
-			check([0x08, 0x00, 0x00, 0x00], {offset: 4}) &&
-			(check([0x2D, 0x00, 0xFE, 0x00], {offset: 8}) ||
-				check([0x27, 0x00, 0xFE, 0x00], {offset: 8}))
+			check([0x08, 0x00, 0x00, 0x00], { offset: 4 }) &&
+			(check([0x2D, 0x00, 0xFE, 0x00], { offset: 8 }) ||
+				check([0x27, 0x00, 0xFE, 0x00], { offset: 8 }))
 		) {
 			return {
 				ext: 'dng',
@@ -623,9 +686,9 @@ async function _fromTokenizer(tokenizer) {
 		buffer = Buffer.alloc(24);
 		await tokenizer.peekBuffer(buffer);
 		if (
-			(check([0x10, 0xFB, 0x86, 0x01], {offset: 4}) || check([0x08, 0x00, 0x00, 0x00], {offset: 4})) &&
+			(check([0x10, 0xFB, 0x86, 0x01], { offset: 4 }) || check([0x08, 0x00, 0x00, 0x00], { offset: 4 })) &&
 			// This pattern differentiates ARW from other TIFF-ish file types:
-			check([0x00, 0xFE, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x01], {offset: 9})
+			check([0x00, 0xFE, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x01], { offset: 9 })
 		) {
 			return {
 				ext: 'arw',
@@ -717,14 +780,14 @@ async function _fromTokenizer(tokenizer) {
 
 	// RIFF file format which might be AVI, WAV, QCP, etc
 	if (check([0x52, 0x49, 0x46, 0x46])) {
-		if (check([0x41, 0x56, 0x49], {offset: 8})) {
+		if (check([0x41, 0x56, 0x49], { offset: 8 })) {
 			return {
 				ext: 'avi',
 				mime: 'video/vnd.avi'
 			};
 		}
 
-		if (check([0x57, 0x41, 0x56, 0x45], {offset: 8})) {
+		if (check([0x57, 0x41, 0x56, 0x45], { offset: 8 })) {
 			return {
 				ext: 'wav',
 				mime: 'audio/vnd.wave'
@@ -732,7 +795,7 @@ async function _fromTokenizer(tokenizer) {
 		}
 
 		// QLCM, QCP file
-		if (check([0x51, 0x4C, 0x43, 0x4D], {offset: 8})) {
+		if (check([0x51, 0x4C, 0x43, 0x4D], { offset: 8 })) {
 			return {
 				ext: 'qcp',
 				mime: 'audio/qcelp'
@@ -818,7 +881,7 @@ async function _fromTokenizer(tokenizer) {
 	// MPEG program stream (PS or MPEG-PS)
 	if (check([0x00, 0x00, 0x01, 0xBA])) {
 		//  MPEG-PS, MPEG-1 Part 1
-		if (check([0x21], {offset: 4, mask: [0xF1]})) {
+		if (check([0x21], { offset: 4, mask: [0xF1] })) {
 			return {
 				ext: 'mpg', // May also be .ps, .mpeg
 				mime: 'video/MP1S'
@@ -826,7 +889,7 @@ async function _fromTokenizer(tokenizer) {
 		}
 
 		// MPEG-PS, MPEG-2 Part 1
-		if (check([0x44], {offset: 4, mask: [0xC4]})) {
+		if (check([0x44], { offset: 4, mask: [0xC4] })) {
 			return {
 				ext: 'mpg', // May also be .mpg, .m2p, .vob or .sub
 				mime: 'video/MP2P'
@@ -959,10 +1022,10 @@ async function _fromTokenizer(tokenizer) {
 
 	// `mov` format variants
 	if (
-		check([0x66, 0x72, 0x65, 0x65], {offset: 4}) || // `free`
-		check([0x6D, 0x64, 0x61, 0x74], {offset: 4}) || // `mdat` MJPEG
-		check([0x6D, 0x6F, 0x6F, 0x76], {offset: 4}) || // `moov`
-		check([0x77, 0x69, 0x64, 0x65], {offset: 4}) // `wide`
+		check([0x66, 0x72, 0x65, 0x65], { offset: 4 }) || // `free`
+		check([0x6D, 0x64, 0x61, 0x74], { offset: 4 }) || // `mdat` MJPEG
+		check([0x6D, 0x6F, 0x6F, 0x76], { offset: 4 }) || // `moov`
+		check([0x77, 0x69, 0x64, 0x65], { offset: 4 }) // `wide`
 	) {
 		return {
 			ext: 'mov',
@@ -1045,14 +1108,14 @@ async function _fromTokenizer(tokenizer) {
 		};
 	}
 
-	if ((check([0x7E, 0x10, 0x04]) || check([0x7E, 0x18, 0x04])) && check([0x30, 0x4D, 0x49, 0x45], {offset: 4})) {
+	if ((check([0x7E, 0x10, 0x04]) || check([0x7E, 0x18, 0x04])) && check([0x30, 0x4D, 0x49, 0x45], { offset: 4 })) {
 		return {
 			ext: 'mie',
 			mime: 'application/x-mie'
 		};
 	}
 
-	if (check([0x27, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], {offset: 2})) {
+	if (check([0x27, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], { offset: 2 })) {
 		return {
 			ext: 'shp',
 			mime: 'application/x-esri-shape'
@@ -1124,7 +1187,7 @@ async function _fromTokenizer(tokenizer) {
 	}
 
 	// Increase sample size from 12 to 256.
-	await tokenizer.peekBuffer(buffer, {length: Math.min(256, tokenizer.fileInfo.size), mayBeLess: true});
+	await tokenizer.peekBuffer(buffer, { length: Math.min(256, tokenizer.fileInfo.size), mayBeLess: true });
 
 	// `raf` is here just to keep all the raw image detectors together.
 	if (checkString('FUJIFILMCCD-RAW')) {
@@ -1149,7 +1212,7 @@ async function _fromTokenizer(tokenizer) {
 	}
 
 	if (
-		check([0x30, 0x30, 0x30, 0x30, 0x30, 0x30], {offset: 148, mask: [0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8]}) && // Valid tar checksum
+		check([0x30, 0x30, 0x30, 0x30, 0x30, 0x30], { offset: 148, mask: [0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8] }) && // Valid tar checksum
 		tarHeaderChecksumMatches(buffer)
 	) {
 		return {
@@ -1159,8 +1222,8 @@ async function _fromTokenizer(tokenizer) {
 	}
 
 	if (check([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3E])) {
-		await tokenizer.readBuffer(buffer, 0, 4100 < tokenizer.fileInfo.size ? 4100 : tokenizer.fileInfo.size );
-		if (find([0x04, 0x00, 0x04, 0x00, 0x40, 0x00, 0x00, 0x00])){
+		await tokenizer.readBuffer(buffer, 0, 4100 < tokenizer.fileInfo.size ? 4100 : tokenizer.fileInfo.size);
+		if (find([0x04, 0x00, 0x04, 0x00, 0x40, 0x00, 0x00, 0x00])) {
 			return {
 				ext: 'xlsx',
 				mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -1170,7 +1233,7 @@ async function _fromTokenizer(tokenizer) {
 				ext: 'msi',
 				mime: 'application/x-msi'
 			};
-		}		
+		}
 	}
 
 	if (check([0x06, 0x0E, 0x2B, 0x34, 0x02, 0x05, 0x01, 0x01, 0x0D, 0x01, 0x02, 0x01, 0x01, 0x02])) {
@@ -1180,28 +1243,28 @@ async function _fromTokenizer(tokenizer) {
 		};
 	}
 
-	if (checkString('SCRM', {offset: 44})) {
+	if (checkString('SCRM', { offset: 44 })) {
 		return {
 			ext: 's3m',
 			mime: 'audio/x-s3m'
 		};
 	}
 
-	if (check([0x47], {offset: 4}) && (check([0x47], {offset: 192}) || check([0x47], {offset: 196}))) {
+	if (check([0x47], { offset: 4 }) && (check([0x47], { offset: 192 }) || check([0x47], { offset: 196 }))) {
 		return {
 			ext: 'mts',
 			mime: 'video/mp2t'
 		};
 	}
 
-	if (check([0x42, 0x4F, 0x4F, 0x4B, 0x4D, 0x4F, 0x42, 0x49], {offset: 60})) {
+	if (check([0x42, 0x4F, 0x4F, 0x4B, 0x4D, 0x4F, 0x42, 0x49], { offset: 60 })) {
 		return {
 			ext: 'mobi',
 			mime: 'application/x-mobipocket-ebook'
 		};
 	}
 
-	if (check([0x44, 0x49, 0x43, 0x4D], {offset: 128})) {
+	if (check([0x44, 0x49, 0x43, 0x4D], { offset: 128 })) {
 		return {
 			ext: 'dcm',
 			mime: 'application/dicom'
@@ -1223,11 +1286,11 @@ async function _fromTokenizer(tokenizer) {
 	}
 
 	if (
-		check([0x4C, 0x50], {offset: 34}) &&
+		check([0x4C, 0x50], { offset: 34 }) &&
 		(
-			check([0x00, 0x00, 0x01], {offset: 8}) ||
-			check([0x01, 0x00, 0x02], {offset: 8}) ||
-			check([0x02, 0x00, 0x02], {offset: 8})
+			check([0x00, 0x00, 0x01], { offset: 8 }) ||
+			check([0x01, 0x00, 0x02], { offset: 8 }) ||
+			check([0x02, 0x00, 0x02], { offset: 8 })
 		)
 	) {
 		return {
@@ -1237,10 +1300,10 @@ async function _fromTokenizer(tokenizer) {
 	}
 
 	// Increase sample size from 256 to 512
-	await tokenizer.peekBuffer(buffer, {length: Math.min(512, tokenizer.fileInfo.size), mayBeLess: true});
+	await tokenizer.peekBuffer(buffer, { length: Math.min(512, tokenizer.fileInfo.size), mayBeLess: true });
 
 	if (
-		check([0x30, 0x30, 0x30, 0x30, 0x30, 0x30], {offset: 148, mask: [0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8]}) && // Valid tar checksum
+		check([0x30, 0x30, 0x30, 0x30, 0x30, 0x30], { offset: 148, mask: [0xF8, 0xF8, 0xF8, 0xF8, 0xF8, 0xF8] }) && // Valid tar checksum
 		tarHeaderChecksumMatches(buffer)
 	) {
 		return {
@@ -1252,10 +1315,10 @@ async function _fromTokenizer(tokenizer) {
 	// Check for MPEG header at different starting offsets
 	for (let start = 0; start < 2 && start < (buffer.length - 16); start++) {
 		// Check MPEG 1 or 2 Layer 3 header, or 'layer 0' for ADTS (MPEG sync-word 0xFFE)
-		if (buffer.length >= start + 2 && check([0xFF, 0xE0], {offset: start, mask: [0xFF, 0xE0]})) {
-			if (check([0x10], {offset: start + 1, mask: [0x16]})) {
+		if (buffer.length >= start + 2 && check([0xFF, 0xE0], { offset: start, mask: [0xFF, 0xE0] })) {
+			if (check([0x10], { offset: start + 1, mask: [0x16] })) {
 				// Check for (ADTS) MPEG-2
-				if (check([0x08], {offset: start + 1, mask: [0x08]})) {
+				if (check([0x08], { offset: start + 1, mask: [0x08] })) {
 					return {
 						ext: 'aac',
 						mime: 'audio/aac'
@@ -1271,7 +1334,7 @@ async function _fromTokenizer(tokenizer) {
 
 			// MPEG 1 or 2 Layer 3 header
 			// Check for MPEG layer 3
-			if (check([0x02], {offset: start + 1, mask: [0x06]})) {
+			if (check([0x02], { offset: start + 1, mask: [0x06] })) {
 				return {
 					ext: 'mp3',
 					mime: 'audio/mpeg'
@@ -1279,7 +1342,7 @@ async function _fromTokenizer(tokenizer) {
 			}
 
 			// Check for MPEG layer 2
-			if (check([0x04], {offset: start + 1, mask: [0x06]})) {
+			if (check([0x04], { offset: start + 1, mask: [0x06] })) {
 				return {
 					ext: 'mp2',
 					mime: 'audio/mpeg'
@@ -1287,7 +1350,7 @@ async function _fromTokenizer(tokenizer) {
 			}
 
 			// Check for MPEG layer 1
-			if (check([0x06], {offset: start + 1, mask: [0x06]})) {
+			if (check([0x06], { offset: start + 1, mask: [0x06] })) {
 				return {
 					ext: 'mp1',
 					mime: 'audio/mpeg'
@@ -1307,7 +1370,7 @@ const stream = readableStream => new Promise((resolve, reject) => {
 		const pass = new stream.PassThrough();
 		let outputStream;
 		if (stream.pipeline) {
-			outputStream = stream.pipeline(readableStream, pass, () => {});
+			outputStream = stream.pipeline(readableStream, pass, () => { });
 		} else {
 			outputStream = readableStream.pipe(pass);
 		}
